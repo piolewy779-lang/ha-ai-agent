@@ -1,4 +1,3 @@
-
 # AI Agent per Home Assistant.
 #
 # Chat via ingress -> OpenAI (Responses API) -> strumenti su Home Assistant.
@@ -51,13 +50,38 @@ BLOCK_WORDS = ("cancello", "garage", "portone", "allarme", "serratura",
 BLOCKED_COVER_CLASSES = {"garage", "gate"}
 FORBIDDEN_DATA_KEYS = {"entity_id", "area_id", "device_id", "floor_id", "label_id"}
  
+# Automazioni: solo costrutti semplici e verificabili, nessun template.
+TRIGGER_KEYS = {
+    "state": {"trigger", "entity_id", "from", "to", "for", "attribute", "not_from", "not_to"},
+    "numeric_state": {"trigger", "entity_id", "above", "below", "for", "attribute"},
+    "time": {"trigger", "at"},
+    "time_pattern": {"trigger", "hours", "minutes", "seconds"},
+    "sun": {"trigger", "event", "offset"},
+}
+CONDITION_KEYS = {
+    "state": {"condition", "entity_id", "state", "for", "attribute"},
+    "numeric_state": {"condition", "entity_id", "above", "below", "attribute"},
+    "time": {"condition", "after", "before", "weekday"},
+    "sun": {"condition", "after", "before", "after_offset", "before_offset"},
+}
+ACTION_KEYS = {"action", "target", "data", "alias"}
+MAX_TRIGGERS, MAX_CONDITIONS, MAX_ACTIONS = 5, 5, 8
+ENTITY_RE = re.compile(r"[a-z_]+\.[a-z0-9_]+")
+DELAY_RE = re.compile(r"\d{1,2}:\d{2}:\d{2}")
+AUTO_PREFIX = "AI Agent: "
+ 
 SYSTEM = (
     "Sei l'assistente di una casa smart basata su Home Assistant. Rispondi sempre "
     "in italiano, in modo breve e chiaro. Per trovare le entità usa cerca_entita, "
     "per leggere lo stato usa leggi_stato. Non puoi eseguire azioni direttamente: "
     "per ogni modifica usa proponi_azione e poi di' all'utente che deve confermare "
     "con il pulsante. Se un'entità non compare nei risultati, non è controllabile: "
-    "non insistere e non aggirare il blocco. Non inventare entity_id."
+    "non insistere e non aggirare il blocco. Non inventare entity_id. "
+    "Se l'utente chiede un'automazione, usa proponi_automazione solo quando la richiesta "
+    "è chiara (quando parte, condizioni, cosa fa); altrimenti fai UNA domanda di chiarimento. "
+    "Cerca prima le entità con cerca_entita. Spiega in italiano, in breve, cosa farà "
+    "l'automazione e ricorda che deve controllarla e confermarla: può crearla disattivata "
+    "oppure attiva. Non puoi creare automazioni su cancello, garage o sicurezza."
 )
  
 TOOLS = [
@@ -80,6 +104,26 @@ TOOLS = [
          "dati": {"type": "object", "description": "Parametri opzionali, es. {\"brightness_pct\": 50}"},
          "motivo": {"type": "string", "description": "Descrizione breve in italiano dell'azione"}},
          "required": ["dominio", "servizio", "entity_id", "motivo"]}},
+    {"type": "function", "name": "proponi_automazione", "strict": False,
+     "description": (
+         "Propone una nuova automazione. Non viene creata finché l'utente non conferma. "
+         "Usa la sintassi moderna di Home Assistant. "
+         "Trigger consentiti: state, numeric_state, time, time_pattern, sun, es. "
+         "{\"trigger\": \"state\", \"entity_id\": \"binary_sensor.x\", \"to\": \"on\"} oppure "
+         "{\"trigger\": \"time\", \"at\": \"07:30:00\"}. "
+         "Condizioni consentite: state, numeric_state, time, sun, es. "
+         "{\"condition\": \"time\", \"after\": \"18:00:00\", \"before\": \"23:00:00\"}. "
+         "Azioni: {\"action\": \"light.turn_on\", \"target\": {\"entity_id\": \"light.x\"}, "
+         "\"data\": {\"brightness_pct\": 50}} oppure {\"delay\": \"00:05:00\"}. "
+         "Niente template, niente area/device come target."),
+     "parameters": {"type": "object", "properties": {
+         "alias": {"type": "string", "description": "Nome breve in italiano"},
+         "descrizione": {"type": "string", "description": "Cosa fa, in una frase"},
+         "triggers": {"type": "array", "items": {"type": "object"}},
+         "conditions": {"type": "array", "items": {"type": "object"}},
+         "actions": {"type": "array", "items": {"type": "object"}},
+         "mode": {"type": "string", "enum": ["single", "restart", "queued", "parallel"]}},
+         "required": ["alias", "triggers", "actions"]}},
 ]
  
 # --- Stato in memoria --------------------------------------------------------
@@ -165,7 +209,7 @@ def tool_proponi(sid, new_pending, dominio, servizio, entity_id, motivo, dati=No
     if err:
         return {"errore": err}
     pid = uuid.uuid4().hex[:8]
-    item = {"id": pid, "sid": sid, "dominio": dominio, "servizio": servizio,
+    item = {"id": pid, "sid": sid, "tipo": "azione", "dominio": dominio, "servizio": servizio,
             "entity_id": entity_id, "dati": dati or {}, "motivo": motivo,
             "created": time.time()}
     with LOCK:
@@ -173,6 +217,170 @@ def tool_proponi(sid, new_pending, dominio, servizio, entity_id, motivo, dati=No
     new_pending.append({k: item[k] for k in ("id", "dominio", "servizio",
                                              "entity_id", "dati", "motivo")})
     return {"stato": "in attesa di conferma dell'utente", "id": pid}
+ 
+ 
+def _ids(v):
+    items = v if isinstance(v, list) else [v]
+    if not items or not all(isinstance(i, str) and ENTITY_RE.fullmatch(i) for i in items):
+        raise ValueError("entity_id non valido")
+    return items
+ 
+ 
+def _esiste(eid):
+    try:
+        ha("GET", f"/states/{eid}")
+    except Exception:
+        raise ValueError(f"entità non trovata: {eid}")
+ 
+ 
+def _lista(args, chiave, massimo, minimo=0):
+    v = args.get(chiave) or []
+    if not isinstance(v, list) or not (minimo <= len(v) <= massimo):
+        raise ValueError(f"'{chiave}' non valido (da {minimo} a {massimo} elementi)")
+    return v
+ 
+ 
+def _blocco(voce, tabella, chiave_tipo, etichetta):
+    if not isinstance(voce, dict) or voce.get(chiave_tipo) not in tabella:
+        raise ValueError(f"tipo di {etichetta} non consentito")
+    extra = set(voce) - tabella[voce[chiave_tipo]]
+    if extra:
+        raise ValueError(f"campi non consentiti in {etichetta}: {sorted(extra)}")
+    voce = dict(voce)
+    ids = []
+    if "entity_id" in voce:
+        ids = _ids(voce["entity_id"])
+        voce["entity_id"] = ids
+        for eid in ids:
+            _esiste(eid)
+    elif voce[chiave_tipo] in ("state", "numeric_state"):
+        raise ValueError(f"manca entity_id in {etichetta}")
+    return voce, ids
+ 
+ 
+def valida_automazione(args):
+    # Restituisce (definizione normalizzata, None) oppure (None, messaggio d'errore).
+    try:
+        alias = str(args.get("alias", "")).strip()[:80]
+        if not alias:
+            raise ValueError("manca il nome")
+        mode = args.get("mode") or "single"
+        if mode not in ("single", "restart", "queued", "parallel"):
+            raise ValueError("modalità non valida")
+        triggers = _lista(args, "triggers", MAX_TRIGGERS, 1)
+        conditions = _lista(args, "conditions", MAX_CONDITIONS)
+        actions = _lista(args, "actions", MAX_ACTIONS, 1)
+        raw = json.dumps([triggers, conditions, actions])
+        if "{{" in raw or "{%" in raw:
+            raise ValueError("i template non sono consentiti")
+ 
+        out_t, trig_ids = [], set()
+        for t in triggers:
+            v, ids = _blocco(t, TRIGGER_KEYS, "trigger", "trigger")
+            out_t.append(v)
+            trig_ids |= set(ids)
+        out_c = [_blocco(c, CONDITION_KEYS, "condition", "condizione")[0] for c in conditions]
+ 
+        out_a, act_ids = [], set()
+        for a in actions:
+            if not isinstance(a, dict):
+                raise ValueError("azione non valida")
+            if "delay" in a:
+                if set(a) != {"delay"} or not isinstance(a["delay"], str) \
+                        or not DELAY_RE.fullmatch(a["delay"]):
+                    raise ValueError("delay non valido (usa HH:MM:SS)")
+                out_a.append({"delay": a["delay"]})
+                continue
+            if "action" not in a or set(a) - ACTION_KEYS:
+                raise ValueError("azione non valida")
+            m = re.fullmatch(r"([a-z_]+)\.([a-z_]+)", a["action"] if isinstance(a["action"], str) else "")
+            if not m:
+                raise ValueError("servizio non valido")
+            dom, nome = m.groups()
+            target = a.get("target") or {}
+            if not isinstance(target, dict) or set(target) - {"entity_id"}:
+                raise ValueError("il target può contenere solo entity_id")
+            ids = _ids(target.get("entity_id"))
+            data = a.get("data") or {}
+            if not isinstance(data, dict):
+                raise ValueError("data non valido")
+            for eid in ids:
+                err = check_action(dom, nome, eid, data)
+                if err:
+                    raise ValueError(f"azione su {eid}: {err}")
+            act_ids |= set(ids)
+            item = {"action": a["action"], "target": {"entity_id": ids}}
+            if data:
+                item["data"] = data
+            out_a.append(item)
+        if not act_ids:
+            raise ValueError("serve almeno un'azione su un'entità")
+        loop = act_ids & trig_ids
+        if loop:
+            raise ValueError("agirebbe sulla stessa entità che la fa partire "
+                             f"(rischio di ciclo): {sorted(loop)}")
+    except ValueError as e:
+        return None, str(e)
+    return {"alias": alias, "description": str(args.get("descrizione", "")).strip()[:200],
+            "triggers": out_t, "conditions": out_c, "actions": out_a, "mode": mode}, None
+ 
+ 
+def tool_proponi_automazione(sid, new_pending, args):
+    d, err = valida_automazione(args)
+    if err:
+        return {"errore": err}
+    pid = uuid.uuid4().hex[:8]
+    item = {"id": pid, "sid": sid, "tipo": "automazione", "def": d,
+            "motivo": d["alias"], "created": time.time()}
+    with LOCK:
+        PENDING[pid] = item
+    new_pending.append({"id": pid, "tipo": "automazione", "motivo": d["alias"],
+                        "definizione": d})
+    return {"stato": "in attesa di conferma dell'utente (potrà crearla disattivata o attiva)",
+            "id": pid}
+ 
+ 
+def crea_automazione(item, attiva):
+    d, err = valida_automazione(item["def"])  # ricontrollo al momento della conferma
+    if err:
+        return {"ok": False, "messaggio": f"Annullata: {err}."}
+    auto_id = "ai_agent_" + str(int(time.time()))
+    body = {"alias": AUTO_PREFIX + d["alias"],
+            "description": ((d["description"] + " ") if d["description"] else "")
+                           + "Creata dall'AI Agent.",
+            "triggers": d["triggers"], "actions": d["actions"], "mode": d["mode"]}
+    if d["conditions"]:
+        body["conditions"] = d["conditions"]
+    try:
+        ha("POST", f"/config/automation/config/{auto_id}", body)
+    except urllib.error.HTTPError as e:
+        dettaglio = e.read().decode(errors="replace")[:300]
+        return {"ok": False, "messaggio": f"Home Assistant ha rifiutato la configurazione "
+                                          f"({e.code}): {dettaglio}"}
+    except Exception as e:
+        return {"ok": False, "messaggio": f"Errore: {str(e)[:150]}"}
+    entita = None
+    for _ in range(8):
+        time.sleep(0.5)
+        for s in ha("GET", "/states"):
+            if s["entity_id"].startswith("automation.") \
+                    and s["attributes"].get("id") == auto_id:
+                entita = s["entity_id"]
+                break
+        if entita:
+            break
+    if not entita:
+        return {"ok": True, "messaggio": "Creata, ma non trovo la sua entità: controlla in "
+                                         "Impostazioni → Automazioni (potrebbe essere attiva)."}
+    if not attiva:
+        try:
+            ha("POST", "/services/automation/turn_off", {"entity_id": entita})
+        except Exception:
+            return {"ok": True, "messaggio": f"Creata ({entita}) ma non sono riuscito a "
+                                             "disattivarla: controllala subito in Impostazioni → Automazioni."}
+    stato = "attiva" if attiva else "disattivata (attivala da Impostazioni → Automazioni)"
+    return {"ok": True, "messaggio": f"Automazione creata: {AUTO_PREFIX}{d['alias']} "
+                                     f"[{entita}], {stato}."}
  
  
 def dispatch(name, args, sid, new_pending):
@@ -183,6 +391,8 @@ def dispatch(name, args, sid, new_pending):
     if name == "proponi_azione":
         return tool_proponi(sid, new_pending, args.get("dominio"), args.get("servizio"),
                             args.get("entity_id"), args.get("motivo", ""), args.get("dati"))
+    if name == "proponi_automazione":
+        return tool_proponi_automazione(sid, new_pending, args)
     return {"errore": "strumento sconosciuto"}
  
  
@@ -236,10 +446,12 @@ def take_pending(pid, sid):
     return item, None
  
  
-def confirm(pid, sid):
+def confirm(pid, sid, attiva=False):
     item, err = take_pending(pid, sid)
     if err:
         return {"ok": False, "messaggio": err}
+    if item.get("tipo") == "automazione":
+        return crea_automazione(item, attiva)
     # Ricontrollo la politica al momento dell'esecuzione (stato cambiato, blocchi, ecc.)
     err = check_action(item["dominio"], item["servizio"], item["entity_id"], item["dati"])
     if err:
@@ -322,7 +534,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(200, {"risposta": f"Errore: {e}", "proposte": []})
         elif path.endswith("/api/confirm"):
-            self._send(200, confirm(str(data.get("id", "")), sid))
+            self._send(200, confirm(str(data.get("id", "")), sid, bool(data.get("attiva"))))
         elif path.endswith("/api/cancel"):
             _, err = take_pending(str(data.get("id", "")), sid)
             self._send(200, {"ok": err is None, "messaggio": err or "Proposta annullata."})
@@ -335,5 +547,7 @@ class Handler(BaseHTTPRequestHandler):
  
 if __name__ == "__main__":
     threading.Thread(target=cleanup_loop, daemon=True).start()
+    print(f"AI Agent avviato. Modello: {MODEL}. Chiave presente: {bool(API_KEY)}. Token HA presente: {bool(SUP_TOKEN)}", flush=True)
+    ThreadingHTTPServer(("0.0.0.0", 8099), Handler).serve_forever()
     print(f"AI Agent avviato. Modello: {MODEL}. Chiave presente: {bool(API_KEY)}. Token HA presente: {bool(SUP_TOKEN)}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", 8099), Handler).serve_forever()
