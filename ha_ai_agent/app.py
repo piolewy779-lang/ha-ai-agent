@@ -1,4 +1,4 @@
-App · PY
+
 # AI Agent per Home Assistant.
 #
 # Chat via ingress -> OpenAI (Responses API) -> strumenti su Home Assistant.
