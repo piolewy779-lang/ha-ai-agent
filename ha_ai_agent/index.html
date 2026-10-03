@@ -83,7 +83,7 @@ document.getElementById('f').onsubmit = async (e) => {
 
 fetch('api/status').then(r => r.json()).then(s => {
   document.getElementById('info').textContent =
-    'AI Agent · modello ' + s.modello + (s.chiave_presente ? '' : ' · ⚠ chiave OpenAI mancante');
+        'AI Agent · modello ' + s.modello + (s.chiave_presente ? '' : ' · ⚠ chiave OpenAI mancante') + (s.token_ha ? '' : ' · ⚠ token Home Assistant mancante');
 }).catch(() => {});
 </script>
 </body>
