@@ -1,1 +1,90 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Agent</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fafafa; --fg:#1c1c1c; --card:#fff; --accent:#03a9f4; --line:#ddd; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111; --fg:#eee; --card:#1c1c1c; --line:#333; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--fg);
+         display:flex; flex-direction:column; height:100vh; }
+  header { padding:10px 14px; border-bottom:1px solid var(--line); font-size:14px; opacity:.8; }
+  #log { flex:1; overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:10px; }
+  .msg { max-width:min(720px,90%); padding:10px 12px; border-radius:12px; background:var(--card);
+         border:1px solid var(--line); white-space:pre-wrap; line-height:1.4; }
+  .user { align-self:flex-end; background:var(--accent); color:#fff; border-color:var(--accent); }
+  .azione { align-self:flex-start; border:2px solid var(--accent); }
+  .azione code { font-size:12px; opacity:.8; display:block; margin:4px 0 8px; word-break:break-all; }
+  button { font:inherit; padding:7px 14px; border-radius:8px; border:1px solid var(--line);
+           background:var(--card); color:var(--fg); cursor:pointer; margin-right:6px; }
+  button.ok { background:var(--accent); color:#fff; border-color:var(--accent); }
+  form { display:flex; gap:8px; padding:10px; border-top:1px solid var(--line); }
+  input { flex:1; font:inherit; padding:10px; border-radius:8px; border:1px solid var(--line);
+          background:var(--card); color:var(--fg); }
+</style>
+</head>
+<body>
+<header id="info">AI Agent</header>
+<div id="log"></div>
+<form id="f"><input id="t" autocomplete="off" placeholder="Scrivi una richiesta…" autofocus><button class="ok">Invia</button></form>
+<script>
+const sid = Math.random().toString(36).slice(2);
+const log = document.getElementById('log');
+const input = document.getElementById('t');
 
+function add(text, cls) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + (cls || '');
+  d.textContent = text;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+  return d;
+}
+
+async function post(path, body) {
+  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ ...body, sid }) });
+  return r.json();
+}
+
+function proposta(p) {
+  const box = document.createElement('div');
+  box.className = 'msg azione';
+  box.append('Azione proposta: ' + p.motivo);
+  const c = document.createElement('code');
+  c.textContent = p.dominio + '.' + p.servizio + ' → ' + p.entity_id +
+                  (Object.keys(p.dati).length ? ' ' + JSON.stringify(p.dati) : '');
+  box.append(c);
+  const ok = document.createElement('button'); ok.className = 'ok'; ok.textContent = 'Conferma';
+  const no = document.createElement('button'); no.textContent = 'Annulla';
+  const done = (m) => { box.textContent = m; };
+  ok.onclick = async () => { ok.disabled = no.disabled = true; done((await post('api/confirm', { id: p.id })).messaggio); };
+  no.onclick = async () => { ok.disabled = no.disabled = true; done((await post('api/cancel', { id: p.id })).messaggio); };
+  box.append(ok, no);
+  log.appendChild(box);
+  log.scrollTop = log.scrollHeight;
+}
+
+document.getElementById('f').onsubmit = async (e) => {
+  e.preventDefault();
+  const m = input.value.trim();
+  if (!m) return;
+  input.value = '';
+  add(m, 'user');
+  const wait = add('…');
+  try {
+    const r = await post('api/chat', { messaggio: m });
+    wait.textContent = r.risposta || r.errore || '(nessuna risposta)';
+    (r.proposte || []).forEach(proposta);
+  } catch (err) { wait.textContent = 'Errore di rete: ' + err; }
+};
+
+fetch('api/status').then(r => r.json()).then(s => {
+  document.getElementById('info').textContent =
+    'AI Agent · modello ' + s.modello + (s.chiave_presente ? '' : ' · ⚠ chiave OpenAI mancante');
+}).catch(() => {});
+</script>
+</body>
+</html>
