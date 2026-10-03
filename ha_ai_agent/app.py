@@ -1,9 +1,8 @@
-""AI Agent per Home Assistant.
-
-Chat via ingress -> OpenAI (Responses API) -> strumenti su Home Assistant.
-L'agente NON esegue mai azioni da solo: le propone e l'utente le conferma
-dalla pagina. Cancello, garage, allarmi, serrature e simili sono esclusi.
-"""
+   # AI Agent per Home Assistant.
+   #
+   # Chat via ingress -> OpenAI (Responses API) -> strumenti su Home Assistant.
+   # L'agente NON esegue mai azioni da solo: le propone e l'utente le conferma
+   # dalla pagina. Cancello, garage, allarmi, serrature e simili sono esclusi.
 import json
 import os
 import re
