@@ -1,1 +1,1 @@
-
+# Nessuna dipendenza esterna: l'app usa solo la libreria standard di Python.
