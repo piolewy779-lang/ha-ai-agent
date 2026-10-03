@@ -1,7 +1,7 @@
 name: "AI Agent"
 slug: "ha_ai_agent"
 description: "Agente AI con controllo dispositivi e conferma esplicita."
-version: "0.1.0"
+version: "0.2.0"
 url: "https://github.com/piolewy779-lang/ha-ai-agent"
 arch:
   - aarch64
@@ -9,7 +9,7 @@ arch:
   - armv7
 
 startup: application
-boot: auto
+boot: manual
 init: false
 
 ingress: true
@@ -21,7 +21,7 @@ homeassistant_api: true
 
 options:
   openai_api_key: ""
-  model: "gpt-4o-mini"
+  model: "gpt-6.1-sol"
 
 schema:
   openai_api_key: password
