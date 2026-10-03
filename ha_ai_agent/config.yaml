@@ -1,7 +1,7 @@
 name: "AI Agent"
 slug: "ha_ai_agent"
 description: "Agente AI con controllo dispositivi e conferma esplicita."
-version: "0.2.0"
+version: "0.2.1"
 url: "https://github.com/piolewy779-lang/ha-ai-agent"
 arch:
   - aarch64
