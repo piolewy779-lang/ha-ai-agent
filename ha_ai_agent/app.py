@@ -1,8 +1,9 @@
-   # AI Agent per Home Assistant.
-   #
-   # Chat via ingress -> OpenAI (Responses API) -> strumenti su Home Assistant.
-   # L'agente NON esegue mai azioni da solo: le propone e l'utente le conferma
-   # dalla pagina. Cancello, garage, allarmi, serrature e simili sono esclusi.
+App · PY
+# AI Agent per Home Assistant.
+#
+# Chat via ingress -> OpenAI (Responses API) -> strumenti su Home Assistant.
+# L'agente NON esegue mai azioni da solo: le propone e l'utente le conferma
+# dalla pagina. Cancello, garage, allarmi, serrature e simili sono esclusi.
 import json
 import os
 import re
@@ -12,18 +13,34 @@ import urllib.error
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
+ 
 with open("/data/options.json", encoding="utf-8") as f:
     OPTIONS = json.load(f)
-
+ 
 API_KEY = (OPTIONS.get("openai_api_key") or "").strip()
 MODEL = (OPTIONS.get("model") or "gpt-6.1-sol").strip()
-SUP_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
+ 
+ 
+def _leggi_token():
+    # Con s6-overlay le variabili d'ambiente possono non arrivare al processo
+    # lanciato da CMD: in quel caso il token sta nei file di s6.
+    t = os.environ.get("SUPERVISOR_TOKEN") or os.environ.get("HASSIO_TOKEN") or ""
+    if not t:
+        try:
+            with open("/run/s6/container_environment/SUPERVISOR_TOKEN",
+                      encoding="utf-8") as fh:
+                t = fh.read().strip()
+        except OSError:
+            t = ""
+    return t
+ 
+ 
+SUP_TOKEN = _leggi_token()
 HA_URL = "http://supervisor/core/api"
 OPENAI_URL = "https://api.openai.com/v1/responses"
 INGRESS_IP = "172.30.32.2"  # unico client ammesso: il gateway ingress del Supervisor
 PENDING_TTL = 600  # secondi di validità di una proposta
-
+ 
 # --- Politica di sicurezza -------------------------------------------------
 ALLOWED_DOMAINS = {"light", "switch", "climate", "fan", "media_player",
                    "scene", "input_boolean", "vacuum", "cover"}
@@ -33,7 +50,7 @@ BLOCK_WORDS = ("cancello", "garage", "portone", "allarme", "serratura",
                "sirena", "citofono")
 BLOCKED_COVER_CLASSES = {"garage", "gate"}
 FORBIDDEN_DATA_KEYS = {"entity_id", "area_id", "device_id", "floor_id", "label_id"}
-
+ 
 SYSTEM = (
     "Sei l'assistente di una casa smart basata su Home Assistant. Rispondi sempre "
     "in italiano, in modo breve e chiaro. Per trovare le entità usa cerca_entita, "
@@ -42,7 +59,7 @@ SYSTEM = (
     "con il pulsante. Se un'entità non compare nei risultati, non è controllabile: "
     "non insistere e non aggirare il blocco. Non inventare entity_id."
 )
-
+ 
 TOOLS = [
     {"type": "function", "name": "cerca_entita",
      "description": "Cerca entità per nome o entity_id. Restituisce al massimo 20 risultati.",
@@ -64,13 +81,13 @@ TOOLS = [
          "motivo": {"type": "string", "description": "Descrizione breve in italiano dell'azione"}},
          "required": ["dominio", "servizio", "entity_id", "motivo"]}},
 ]
-
+ 
 # --- Stato in memoria --------------------------------------------------------
 SESSIONS = {}   # sid -> id dell'ultima risposta OpenAI
 PENDING = {}    # id proposta -> dict
 LOCK = threading.Lock()
-
-
+ 
+ 
 def ha(method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
@@ -80,8 +97,8 @@ def ha(method, path, body=None):
     with urllib.request.urlopen(req, timeout=15) as r:
         raw = r.read()
         return json.loads(raw) if raw else None
-
-
+ 
+ 
 def is_blocked(state):
     eid = state["entity_id"]
     attrs = state.get("attributes", {})
@@ -94,8 +111,8 @@ def is_blocked(state):
     if domain == "cover" and attrs.get("device_class") in BLOCKED_COVER_CLASSES:
         return True
     return False
-
-
+ 
+ 
 def tool_cerca(query, dominio=None):
     tokens = query.lower().split()
     out = []
@@ -114,16 +131,16 @@ def tool_cerca(query, dominio=None):
             if len(out) >= 20:
                 break
     return out
-
-
+ 
+ 
 def tool_stato(entity_id):
     s = ha("GET", f"/states/{entity_id}")
     if is_blocked(s):
         return {"errore": "entità non accessibile"}
     attrs = json.dumps(s["attributes"], ensure_ascii=False)[:1500]
     return {"entity_id": entity_id, "stato": s["state"], "attributi": attrs}
-
-
+ 
+ 
 def check_action(dominio, servizio, entity_id, dati):
     if dominio not in ALLOWED_DOMAINS:
         return f"dominio '{dominio}' non consentito"
@@ -141,8 +158,8 @@ def check_action(dominio, servizio, entity_id, dati):
     if is_blocked(s):
         return "entità non controllabile"
     return None
-
-
+ 
+ 
 def tool_proponi(sid, new_pending, dominio, servizio, entity_id, motivo, dati=None):
     err = check_action(dominio, servizio, entity_id, dati)
     if err:
@@ -156,8 +173,8 @@ def tool_proponi(sid, new_pending, dominio, servizio, entity_id, motivo, dati=No
     new_pending.append({k: item[k] for k in ("id", "dominio", "servizio",
                                              "entity_id", "dati", "motivo")})
     return {"stato": "in attesa di conferma dell'utente", "id": pid}
-
-
+ 
+ 
 def dispatch(name, args, sid, new_pending):
     if name == "cerca_entita":
         return tool_cerca(args.get("query", ""), args.get("dominio"))
@@ -167,8 +184,8 @@ def dispatch(name, args, sid, new_pending):
         return tool_proponi(sid, new_pending, args.get("dominio"), args.get("servizio"),
                             args.get("entity_id"), args.get("motivo", ""), args.get("dati"))
     return {"errore": "strumento sconosciuto"}
-
-
+ 
+ 
 def openai(body):
     req = urllib.request.Request(
         OPENAI_URL, data=json.dumps(body).encode(),
@@ -179,8 +196,8 @@ def openai(body):
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:400]
         raise RuntimeError(f"OpenAI ha risposto {e.code}: {detail}")
-
-
+ 
+ 
 def run_chat(sid, message):
     new_pending = []
     inp = [{"role": "user", "content": message}]
@@ -207,8 +224,8 @@ def run_chat(sid, message):
             inp.append({"type": "function_call_output", "call_id": c["call_id"],
                         "output": json.dumps(res, ensure_ascii=False)})
     return "Troppi passaggi: prova con una richiesta più semplice.", new_pending
-
-
+ 
+ 
 def take_pending(pid, sid):
     with LOCK:
         item = PENDING.pop(pid, None)
@@ -217,8 +234,8 @@ def take_pending(pid, sid):
     if time.time() - item["created"] > PENDING_TTL:
         return None, "Proposta scaduta: richiedila di nuovo."
     return item, None
-
-
+ 
+ 
 def confirm(pid, sid):
     item, err = take_pending(pid, sid)
     if err:
@@ -235,8 +252,8 @@ def confirm(pid, sid):
     except Exception as e:
         return {"ok": False, "messaggio": f"Errore: {str(e)[:150]}"}
     return {"ok": True, "messaggio": "Eseguito: " + item["motivo"]}
-
-
+ 
+ 
 def cleanup_loop():
     while True:
         time.sleep(60)
@@ -244,13 +261,13 @@ def cleanup_loop():
         with LOCK:
             for k in [k for k, v in PENDING.items() if now - v["created"] > PENDING_TTL]:
                 PENDING.pop(k, None)
-
-
+ 
+ 
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html"),
           "rb") as f:
     INDEX = f.read()
-
-
+ 
+ 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, payload, ctype="application/json"):
         body = payload if isinstance(payload, bytes) else json.dumps(
@@ -261,20 +278,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
-
+ 
     def _allowed(self):
         if self.client_address[0] != INGRESS_IP:
             self._send(403, {"errore": "accesso negato"})
             return False
         return True
-
+ 
     def _json(self):
         n = min(int(self.headers.get("Content-Length") or 0), 65536)
         try:
             return json.loads(self.rfile.read(n) or b"{}")
         except json.JSONDecodeError:
             return {}
-
+ 
     def do_GET(self):
         if not self._allowed():
             return
@@ -282,10 +299,10 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             self._send(200, INDEX, "text/html")
         elif path.endswith("/api/status"):
-            self._send(200, {"modello": MODEL, "chiave_presente": bool(API_KEY)})
+            self._send(200, {"modello": MODEL, "chiave_presente": bool(API_KEY), "token_ha": bool(SUP_TOKEN)})
         else:
             self._send(404, {"errore": "non trovato"})
-
+ 
     def do_POST(self):
         if not self._allowed():
             return
@@ -311,13 +328,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": err is None, "messaggio": err or "Proposta annullata."})
         else:
             self._send(404, {"errore": "non trovato"})
-
+ 
     def log_message(self, fmt, *args):
         pass  # niente log delle richieste: evita rumore e dati sensibili
-
-
+ 
+ 
 if __name__ == "__main__":
     threading.Thread(target=cleanup_loop, daemon=True).start()
-    print(f"AI Agent avviato. Modello: {MODEL}. Chiave presente: {bool(API_KEY)}", flush=True)
+    print(f"AI Agent avviato. Modello: {MODEL}. Chiave presente: {bool(API_KEY)}. Token HA presente: {bool(SUP_TOKEN)}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", 8099), Handler).serve_forever()
-
